@@ -2,6 +2,7 @@ import os
 import time
 import json
 import asyncio
+import subprocess
 import uuid
 from pathlib import Path
 from datetime import datetime
@@ -10,16 +11,8 @@ from dotenv import load_dotenv
 from nicegui import ui, app
 
 from google.cloud import storage
-from google.cloud.speech_v2 import (
-    SpeechClient, 
-    AutoDetectDecodingConfig, 
-    RecognitionConfig, 
-    RecognitionFeatures, 
-    BatchRecognizeRequest, 
-    BatchRecognizeFileMetadata, 
-    RecognitionOutputConfig, 
-    InlineOutputConfig
-)
+from google.cloud import speech_v1
+from google.cloud import speech_v2
 from google.oauth2 import service_account
 
 # Load environment variables
@@ -42,11 +35,23 @@ class AppState:
         
         self.is_processing = False
 
+        # Transcription Options
+        self.api_version = "V2 (BatchRecognize)"
+        self.model = "chirp_2"
+        self.language_code = "en-US"
+        self.profanity_filter = False
+        self.enable_automatic_punctuation = False
+        self.enable_spoken_punctuation = False
+        self.enable_spoken_emojis = False
+        self.speaker_diarization = False
+        self.enable_word_time_offsets = True
+        self.max_alternatives = 1
+
 state = AppState()
 
 # UI State variables for binding
 ui_state = {
-    'log': 'Welcome to the Long-Audio Speech-to-Text Transcriber (Chirp V2).',
+    'log': 'Welcome to the Long-Audio Speech-to-Text Transcriber.',
     'status': 'Idle'
 }
 
@@ -56,9 +61,6 @@ def log(message: str):
     print(full_message)
     ui_state['log'] += f"\n{full_message}"
     
-    # We update the log element in the UI via the bound element if possible,
-    # or rely on ui.timer/bind_text to refresh.
-
 async def handle_cred_upload(e):
     try:
         content = await e.file.text()
@@ -95,72 +97,223 @@ async def process_audio():
     btn_start.disable()
     
     try:
-        # 1. Initialize GCP clients
         log("Initializing GCP clients...")
         credentials = service_account.Credentials.from_service_account_info(state.credentials_info)
         storage_client = storage.Client(credentials=credentials)
-        speech_client = SpeechClient(credentials=credentials)
         project_id = credentials.project_id
         
-        # 2. Upload to GCS
+        client_options = None
+        if state.gcp_location and state.gcp_location != "global":
+            client_options = {"api_endpoint": f"{state.gcp_location}-speech.googleapis.com"}
+        
         unique_id = str(uuid.uuid4())[:8]
-        gcs_filename = f"audio_{unique_id}_{state.audio_filename}"
-        log(f"Uploading audio to gs://{state.gcs_bucket}/{gcs_filename} ...")
-        
         bucket = storage_client.bucket(state.gcs_bucket)
-        blob = bucket.blob(gcs_filename)
-        # Uploading synchronously might block the UI, but we run in an async context,
-        # ideally we should run blocking in an executor. For simplicity, we just upload.
-        await asyncio.to_thread(blob.upload_from_string, state.audio_content)
-        gcs_uri = f"gs://{state.gcs_bucket}/{gcs_filename}"
-        log(f"✅ Uploaded to {gcs_uri}")
-        
-        # 3. Trigger BatchRecognize (V2)
-        log(f"Starting V2 BatchRecognize operation using Chirp model in {state.gcp_location}...")
-        recognizer_path = f"projects/{project_id}/locations/{state.gcp_location}/recognizers/_"
-        
-        config = RecognitionConfig(
-            auto_decoding_config=AutoDetectDecodingConfig(),
-            model="chirp",
-            language_codes=["en-US"], # Chirp supports multi-language, but en-US is standard default
-            features=RecognitionFeatures(
-                enable_word_time_offsets=True,
-            ),
-        )
-        
-        request = BatchRecognizeRequest(
-            recognizer=recognizer_path,
-            config=config,
-            files=[BatchRecognizeFileMetadata(uri=gcs_uri)],
-            recognition_output_config=RecognitionOutputConfig(
-                inline_response_config=InlineOutputConfig()
-            )
-        )
-        
-        operation = await asyncio.to_thread(speech_client.batch_recognize, request=request)
-        log("Batch recognition operation started. Waiting for results (this may take several minutes)...")
-        
-        # 4. Wait for operation
-        response = await asyncio.to_thread(operation.result, timeout=7200) # Up to 2 hours
-        log("✅ Recognition operation completed!")
-        
-        # 5. Process results
         full_transcript = []
-        for uri, result_file in response.results.items():
-            if result_file.error and result_file.error.code != 0:
-                log(f"⚠️ Error for {uri}: {result_file.error.message}")
-            if result_file.inline_result:
-                for result in result_file.inline_result.transcript.results:
-                    if result.alternatives:
-                        full_transcript.append(result.alternatives[0].transcript)
+
+        if state.api_version == "V1 (LongRunningRecognize)":
+            # ---------------- V1 Logic (No chunking needed) ----------------
+            gcs_filename = f"audio_{unique_id}_{state.audio_filename}"
+            log(f"Uploading audio to gs://{state.gcs_bucket}/{gcs_filename} ...")
+            blob = bucket.blob(gcs_filename)
+            await asyncio.to_thread(blob.upload_from_string, state.audio_content)
+            gcs_uri = f"gs://{state.gcs_bucket}/{gcs_filename}"
+            log(f"✅ Uploaded to {gcs_uri}")
+
+            speech_client = speech_v1.SpeechClient(credentials=credentials, client_options=client_options)
+            log(f"Starting V1 LongRunningRecognize operation using {state.model} model in {state.gcp_location}...")
+            
+            diarization_config = speech_v1.SpeakerDiarizationConfig(
+                enable_speaker_diarization=state.speaker_diarization,
+            )
+
+            config = speech_v1.RecognitionConfig(
+                encoding=speech_v1.RecognitionConfig.AudioEncoding.MP3,
+                language_code=state.language_code,
+                model=state.model,
+                profanity_filter=state.profanity_filter,
+                enable_automatic_punctuation=state.enable_automatic_punctuation,
+                enable_spoken_punctuation=state.enable_spoken_punctuation,
+                enable_spoken_emojis=state.enable_spoken_emojis,
+                enable_word_time_offsets=state.enable_word_time_offsets,
+                max_alternatives=int(state.max_alternatives),
+                diarization_config=diarization_config,
+            )
+            audio = speech_v1.RecognitionAudio(uri=gcs_uri)
+            
+            operation = await asyncio.to_thread(speech_client.long_running_recognize, config=config, audio=audio)
+            log("Long running recognition operation started. Waiting for results (this may take several minutes)...")
+            response = await asyncio.to_thread(operation.result, timeout=28800)
+            log("✅ Recognition operation completed!")
+            
+            for result in response.results:
+                if result.alternatives:
+                    full_transcript.append(result.alternatives[0].transcript)
+
+            log(f"Cleaning up {gcs_uri} from GCS...")
+            await asyncio.to_thread(blob.delete)
+            log("✅ Cleanup complete.")
+                    
+        else: 
+            # ---------------- V2 Logic (With 15-min Chunking) ----------------
+            log("Chunking audio file into 15-minute segments to bypass BatchRecognize limits...")
+            input_path = TEMP_DIR / f"input_{unique_id}.mp3"
+            with open(input_path, "wb") as f:
+                f.write(state.audio_content)
+                
+            chunk_dir = TEMP_DIR / f"{unique_id}_chunks"
+            chunk_dir.mkdir(exist_ok=True)
+            chunk_pattern = chunk_dir / "chunk_%03d.mp3"
+            
+            cmd = ["ffmpeg", "-i", str(input_path), "-f", "segment", "-segment_time", "900", "-c", "copy", str(chunk_pattern)]
+            def run_ffmpeg():
+                subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            await asyncio.to_thread(run_ffmpeg)
+            
+            chunks = sorted(chunk_dir.glob("chunk_*.mp3"))
+            log(f"✅ Split audio into {len(chunks)} chunks.")
+            
+            gcs_uris = []
+            uploaded_blobs = []
+            log(f"Uploading {len(chunks)} chunks to GCS...")
+            for chunk_file in chunks:
+                chunk_blob_name = f"audio_{unique_id}_{chunk_file.name}"
+                blob = bucket.blob(chunk_blob_name)
+                await asyncio.to_thread(blob.upload_from_filename, str(chunk_file))
+                gcs_uris.append(f"gs://{state.gcs_bucket}/{chunk_blob_name}")
+                uploaded_blobs.append(blob)
+                
+            speech_client = speech_v2.SpeechClient(credentials=credentials, client_options=client_options)
+            log(f"Starting V2 BatchRecognize operation using {state.model} model in {state.gcp_location}...")
+            recognizer_path = f"projects/{project_id}/locations/{state.gcp_location}/recognizers/_"
+            
+            features = speech_v2.RecognitionFeatures(
+                profanity_filter=state.profanity_filter,
+                enable_automatic_punctuation=state.enable_automatic_punctuation,
+                enable_spoken_punctuation=state.enable_spoken_punctuation,
+                enable_spoken_emojis=state.enable_spoken_emojis,
+                enable_word_time_offsets=state.enable_word_time_offsets,
+                max_alternatives=int(state.max_alternatives),
+            )
+
+            if state.speaker_diarization:
+                features.diarization_config = speech_v2.SpeakerDiarizationConfig()
+
+            config = speech_v2.RecognitionConfig(
+                auto_decoding_config=speech_v2.AutoDetectDecodingConfig(),
+                model=state.model,
+                language_codes=[state.language_code],
+                features=features,
+            )
+            
+            gcs_output_uri = f"gs://{state.gcs_bucket}/results/{unique_id}/"
+            
+            # BatchRecognize accepts max 15 files per request, so if there's more than 15 chunks, process them in batches of 15
+            batch_size = 15
+            for i in range(0, len(gcs_uris), batch_size):
+                batch_uris = gcs_uris[i:i+batch_size]
+                log(f"Processing batch of {len(batch_uris)} chunks...")
+                
+                request = speech_v2.BatchRecognizeRequest(
+                    recognizer=recognizer_path,
+                    config=config,
+                    files=[speech_v2.BatchRecognizeFileMetadata(uri=uri) for uri in batch_uris],
+                    recognition_output_config=speech_v2.RecognitionOutputConfig(
+                        gcs_output_config=speech_v2.GcsOutputConfig(uri=gcs_output_uri)
+                    )
+                )
+                
+                operation = await asyncio.to_thread(speech_client.batch_recognize, request=request)
+                log(f"Batch recognition operation started. Operation ID: {operation.operation.name}")
+                
+                try:
+                    start_time = time.time()
+                    last_log_time = start_time
+                    while not await asyncio.to_thread(operation.done):
+                        await asyncio.sleep(15) # Check status every 15 seconds
                         
+                        elapsed = int(time.time() - start_time)
+                        if time.time() - last_log_time >= 60: # Log every 1 minute
+                            meta = operation.metadata
+                            if meta:
+                                try:
+                                    progress = getattr(meta, 'progress_percent', 0)
+                                    log(f"⏱️ Elapsed: {elapsed}s. GCP Overall Progress: {progress}%")
+                                    
+                                    brm = getattr(meta, 'batch_recognize_metadata', None)
+                                    if brm and hasattr(brm, 'transcription_metadata'):
+                                        count = 0
+                                        for uri, fmeta in brm.transcription_metadata.items():
+                                            chunk_prog = getattr(fmeta, 'progress_percent', 0)
+                                            if chunk_prog > 0:
+                                                log(f"   -> {uri.split('/')[-1]}: {chunk_prog}%")
+                                                count += 1
+                                        if count == 0 and progress == 0:
+                                            log(f"   (Waiting for chunks to start processing...)")
+                                except Exception as e:
+                                    log(f"⏱️ Elapsed: {elapsed}s. Processing on GCP... (Could not parse progress: {e})")
+                            else:
+                                log(f"⏱️ Elapsed: {elapsed}s. No metadata received from GCP yet.")
+                            last_log_time = time.time()
+                            
+                        if elapsed > 28800:
+                            raise Exception("Operation timed out locally after 8 hours.")
+                            
+                    response = operation.result()
+                    log(f"✅ Batch Recognition completed in {int(time.time() - start_time)} seconds!")
+                except Exception as op_ex:
+                    log(f"⚠️ Operation error or timeout: {op_ex}")
+                    raise op_ex
+                
+                # We sort the results by filename to ensure correct transcript order
+                sorted_results = sorted(response.results.items(), key=lambda x: x[0])
+                
+                for uri, result_file in sorted_results:
+                    if result_file.error and result_file.error.code != 0:
+                        log(f"⚠️ Error for {uri}: {result_file.error.message}")
+                    
+                    if result_file.cloud_storage_result and result_file.cloud_storage_result.uri:
+                        result_uri = result_file.cloud_storage_result.uri
+                        
+                        prefix = f"gs://{state.gcs_bucket}/"
+                        if result_uri.startswith(prefix):
+                            blob_path = result_uri[len(prefix):]
+                            result_blob = bucket.blob(blob_path)
+                            
+                            json_data = await asyncio.to_thread(result_blob.download_as_text)
+                            batch_res = speech_v2.BatchRecognizeResults.from_json(json_data)
+                            
+                            for res in batch_res.results:
+                                if res.alternatives:
+                                    full_transcript.append(res.alternatives[0].transcript)
+                            
+                            await asyncio.to_thread(result_blob.delete)
+                    
+                    elif result_file.inline_result:
+                        for res in result_file.inline_result.transcript.results:
+                            if res.alternatives:
+                                full_transcript.append(res.alternatives[0].transcript)
+
+            log(f"Cleaning up {len(uploaded_blobs)} chunks from GCS...")
+            for blob in uploaded_blobs:
+                await asyncio.to_thread(blob.delete)
+            
+            # Clean up local chunks
+            try:
+                for chunk_file in chunks:
+                    chunk_file.unlink()
+                chunk_dir.rmdir()
+                input_path.unlink()
+            except Exception as e:
+                log(f"⚠️ Could not remove local temp files: {e}")
+                
+            log("✅ Cleanup complete.")
+
         transcript_text = "\n".join(full_transcript)
         
         if not transcript_text.strip():
             log("⚠️ Transcript is empty. No speech was detected.")
             transcript_text = "(No speech detected)"
             
-        # 6. Save locally
         timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S")
         res_dir = RESULTS_DIR / timestamp_str
         res_dir.mkdir(exist_ok=True)
@@ -170,11 +323,6 @@ async def process_audio():
             f.write(transcript_text)
             
         log(f"✅ Transcript saved locally to {out_filepath}")
-        
-        # 7. Cleanup GCS (Optional, but implemented)
-        log(f"Cleaning up {gcs_uri} from GCS...")
-        await asyncio.to_thread(blob.delete)
-        log("✅ Cleanup complete.")
         
         ui.notify(f"Transcription complete! Saved to {out_filepath}", type='positive', timeout=10000)
         
@@ -186,10 +334,9 @@ async def process_audio():
         ui_state['status'] = 'Idle'
         btn_start.enable()
 
-# Build the UI
 @ui.page('/')
 def index():
-    ui.page_title('Chirp V2 Transcriber')
+    ui.page_title('Speech-to-Text Transcriber')
     
     with ui.column().classes('w-full max-w-4xl mx-auto p-4 gap-6'):
         ui.label('Long-Audio Speech-to-Text Transcriber').classes('text-3xl font-bold text-center')
@@ -199,7 +346,14 @@ def index():
             
             with ui.row().classes('w-full items-center gap-4'):
                 ui.input('GCS Bucket Name', placeholder='my-bucket-name').bind_value(state, 'gcs_bucket').classes('flex-grow')
-                ui.input('GCP Location', placeholder='us-central1').bind_value(state, 'gcp_location').classes('w-32')
+                
+                locations = [
+                    'us-central1', 'us', 'eu', 'global', 
+                    'asia-northeast1', 'asia-south1', 'asia-southeast1', 
+                    'europe-west2', 'europe-west3', 'europe-west4',
+                    'northamerica-northeast1'
+                ]
+                ui.select(locations, label='GCP Location').bind_value(state, 'gcp_location').classes('w-48')
                 
             ui.label('Upload Service Account JSON (Credentials):').classes('mt-4 font-medium')
             ui.upload(on_upload=handle_cred_upload, max_files=1).props('accept=".json"').classes('max-w-full')
@@ -208,6 +362,32 @@ def index():
             ui.label('2. Audio Input').classes('text-xl font-semibold mb-2')
             ui.label('Upload MP3 File (will be temporarily stored in GCS):').classes('font-medium')
             ui.upload(on_upload=handle_audio_upload, max_files=1).props('accept=".mp3,audio/mpeg"').classes('max-w-full')
+            
+        with ui.card().classes('w-full'):
+            ui.label('3. Transcription Options').classes('text-xl font-semibold mb-2')
+            
+            with ui.row().classes('w-full gap-4'):
+                api_versions = ['V1 (LongRunningRecognize)', 'V2 (BatchRecognize)']
+                ui.select(api_versions, label='API Version').bind_value(state, 'api_version').classes('w-64')
+                
+                models = [
+                    'chirp_2', 'chirp_3', 'chirp3', 'chirp', 'long', 'short', 
+                    'telephony', 'latest_long', 'latest_short', 
+                    'latest_telephony', 'default'
+                ]
+                ui.select(models, label='Model').bind_value(state, 'model').classes('flex-grow')
+                ui.input('Language Code (e.g. en-US, es-ES)').bind_value(state, 'language_code').classes('w-32')
+                ui.number('Max Alts', min=1, max=30, value=1).bind_value(state, 'max_alternatives').classes('w-24')
+
+            with ui.row().classes('w-full gap-4 mt-2'):
+                ui.checkbox('Profanity Filter').bind_value(state, 'profanity_filter')
+                ui.checkbox('Automatic Punctuation').bind_value(state, 'enable_automatic_punctuation')
+                ui.checkbox('Spoken Punctuation').bind_value(state, 'enable_spoken_punctuation')
+                ui.checkbox('Spoken Emojis').bind_value(state, 'enable_spoken_emojis')
+                
+            with ui.row().classes('w-full gap-4 mt-2'):
+                ui.checkbox('Speaker Diarization').bind_value(state, 'speaker_diarization')
+                ui.checkbox('Word-Time Offsets').bind_value(state, 'enable_word_time_offsets')
             
         with ui.row().classes('w-full justify-center mt-4'):
             global btn_start
@@ -219,10 +399,8 @@ def index():
             ui.label().bind_text_from(ui_state, 'status', backward=lambda s: f"Status: {s}").classes('font-bold mb-2')
             
             log_view = ui.log().classes('w-full h-64 font-mono text-sm bg-black text-green-400 p-2 rounded')
-            # Custom bind for log, since ui.log is a bit different. We'll just push to it in a timer.
             
             def update_log():
-                # Split log state by newline and only add new lines
                 current_lines = ui_state['log'].split('\n')
                 if not hasattr(log_view, '_last_line_count'):
                     log_view._last_line_count = 0

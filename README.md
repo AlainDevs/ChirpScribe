@@ -1,6 +1,6 @@
 # ChirpScribe
 
-A web-based tool built with [NiceGUI](https://nicegui.io/) to transcribe long MP3 audio files (over 20 minutes) using the Google Cloud Speech-to-Text V2 API and the highly accurate **Chirp** model.
+A web-based tool built with [NiceGUI](https://nicegui.io/) to transcribe long MP3 audio files (over 20 minutes) using the Google Cloud Speech-to-Text V2 API and the highly accurate **Chirp3** model.
 
 Because Google Cloud enforces strict file size and duration limits on synchronous requests, this app seamlessly circumvents the 20-minute barrier by:
 1. Temporarily uploading your audio file to a Google Cloud Storage (GCS) bucket.
