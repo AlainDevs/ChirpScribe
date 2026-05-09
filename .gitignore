@@ -1,0 +1,12 @@
+venv/
+.venv/
+__pycache__/
+*.pyc
+.env
+results/
+temp/
+*.json
+!credentials.example.json
+
+#test_files
+test_files/
